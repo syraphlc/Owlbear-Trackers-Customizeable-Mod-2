@@ -1,385 +1,497 @@
+import OBR, { Image, Item, Metadata, isImage } from "@owlbear-rodeo/sdk";
+import { getPluginId } from "../getPluginId";
 import {
-  AttachmentBehavior,
-  Image,
-  Item,
-  buildCurve,
-  buildImage,
-  buildShape,
-  buildText,
-} from "@owlbear-rodeo/sdk";
-import { getColor } from "../colorHelpers";
-import { Tracker } from "../TrackerZod";
-import { createRoundedRectangle, getFillPortion } from "./mathHelpers";
+  FULL_BAR_HEIGHT,
+  createTrackerBubble,
+  createTrackerBar,
+  getBarItemIds,
+  getBarTextId,
+  getBubbleItemIds,
+  createImageBubble,
+  getImageBubbleItemIds,
+  REDUCED_BAR_HEIGHT,
+  MINIMAL_BAR_HEIGHT,
+  createMinimalTrackerBar,
+  getImageId,
+  getImageBackgroundId,
+} from "./compoundItemHelpers";
+import {
+  getTrackersFromItem,
+  getTrackersHiddenFromItem,
+} from "../trackerHelpersItem";
+import {
+  TRACKER_METADATA_ID,
+  HIDDEN_METADATA_ID,
+  MAX_TRACKER_COUNT,
+} from "../trackerHelpersBasic";
+import { BubblePosition } from "./trackerPositionHelper";
+import { getImageCenter } from "./mathHelpers";
+import { SettingsZod } from "../state/SettingsZod";
+import { defaultSettings } from "../state/defaultTrackersState";
 
-// Constants used in multiple functions
-const FONT = "Roboto, sans-serif";
-const DISABLE_HIT = true;
-const BUBBLE_OPACITY = 0.7;
-const DISABLE_ATTACHMENT_BEHAVIORS: AttachmentBehavior[] = [
-  "ROTATION",
-  "VISIBLE",
-  "COPY",
-  "SCALE",
-];
-const TEXT_VERTICAL_OFFSET = -1.2;
+let itemsLast: Image[] = []; // for item change checks
+const addItemsArray: Item[] = []; // for bulk addition or changing of items
+const deleteItemsArray: string[] = []; // for bulk deletion of scene items
+let sceneListenersSet = false;
+let userRoleLast: "GM" | "PLAYER";
 
-// Constants used in createStatBubble()
-export const BUBBLE_DIAMETER = 30;
+let verticalOffset = 0;
+let trackersAboveToken = false;
+let barHeightIsReduced = false;
+let segmentsEnabled = true;
+let segmentSettings = new Map<string, number>();
 
-/** Creates Stat Bubble component items */
-export function createTrackerBubble(
-  item: Item,
-  tracker: Tracker,
-  position: { x: number; y: number },
-  index: number,
-): Item[] {
-  if (
-    tracker.variant !== "value" &&
-    tracker.variant !== "counter" &&
-    tracker.variant !== "checkbox"
-  )
-    throw new Error("Expected value or counter tracker variant");
+let extraRefreshIsDone = false;
+const extraRefreshDelay = 1000;
 
-  const diameter = tracker.bubbleSize ?? BUBBLE_DIAMETER;
-  const bubblePosition = {
-    x: position.x + (tracker.bubbleOffsetX ?? 0),
-    y: position.y + (tracker.bubbleOffsetY ?? 0),
-  };
-  const bubbleShape = buildShape()
-    .width(diameter)
-    .height(diameter)
-    .shapeType("CIRCLE")
-    .fillColor(getColor(tracker.color))
-    .fillOpacity(BUBBLE_OPACITY)
-    .strokeColor(tracker.bubbleOutlineColor ?? getColor(tracker.color))
-    .strokeOpacity(tracker.bubbleOutlineWidth ? 1 : 0.5)
-    .strokeWidth(tracker.bubbleOutlineWidth ?? 0)
-    .position(bubblePosition)
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(getBubbleBackgroundId(item.id, index))
-    .visible(item.visible)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .build();
+export async function initOnMapTrackers() {
+  // Handle when the scene is either changed or made ready after extension load
+  OBR.scene.onReadyChange(async (isReady) => {
+    if (isReady) {
+      await getGlobalSettings();
+      await refreshAllTrackers();
+      await startTrackerUpdates();
+      setTimeout(() => {
+        if (!extraRefreshIsDone) refreshAllTrackers();
+        extraRefreshIsDone = true;
+      }, extraRefreshDelay);
+    }
+  });
 
-  const valueText =
-    tracker.variant === "checkbox"
-      ? tracker.checked === true
-        ? "✓"
-        : "◯"
-      : tracker.value.toString();
+  // Check if the scene is already ready once the extension loads
+  const isReady = await OBR.scene.isReady();
+  if (isReady) {
+    await getGlobalSettings();
+    await refreshAllTrackers();
+    await startTrackerUpdates();
+    setTimeout(() => {
+      if (!extraRefreshIsDone) refreshAllTrackers();
+      extraRefreshIsDone = true;
+    }, extraRefreshDelay);
+  }
+}
 
-  if (tracker.variant === "checkbox") bubblePosition.y += 3;
-
-  const defaultFontSize =
-    valueText.length === 3
-      ? Math.max(6, diameter - 15)
-      : Math.max(6, diameter - 8);
-
-  const bubbleTextBuilder = buildText()
-    .position({
-      x: bubblePosition.x - diameter / 2,
-      y: bubblePosition.y - diameter / 2 + TEXT_VERTICAL_OFFSET,
-    })
-    .plainText(valueText.length > 3 ? String.fromCharCode(0x2026) : valueText)
-    .textAlign("CENTER")
-    .textAlignVertical("MIDDLE")
-    .fontSize(tracker.bubbleFontSize ?? defaultFontSize)
-    .fontFamily(tracker.bubbleFontFamily ?? FONT)
-    .textType("PLAIN")
-    .height(diameter + 2)
-    .width(diameter)
-    .fontWeight(tracker.bubbleFontWeight ?? 400)
-    .attachedTo(item.id)
-    .layer("TEXT")
-    .locked(true)
-    .id(getBubbleTextId(item.id, index))
-    .visible(item.visible)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT);
-
-  if (tracker.bubbleTextColor !== undefined)
-    bubbleTextBuilder.fillColor(tracker.bubbleTextColor);
-  if ((tracker.bubbleTextOutlineWidth ?? 0) > 0) {
-    bubbleTextBuilder
-      .strokeColor(tracker.bubbleTextOutlineColor ?? "#000000")
-      .strokeWidth(tracker.bubbleTextOutlineWidth ?? 0);
+/** returns true if global settings have changed */
+async function getGlobalSettings(roomMetadata?: Metadata): Promise<boolean> {
+  // load settings from room metadata if not passed to function
+  if (typeof roomMetadata === "undefined") {
+    roomMetadata = await OBR.room.getMetadata();
   }
 
-  const bubbleText = bubbleTextBuilder.build();
+  const settingsData = SettingsZod.partial().safeParse(
+    roomMetadata[getPluginId("settings")],
+  );
+  const settings = { ...defaultSettings, ...settingsData.data };
 
-  return [bubbleShape, bubbleText];
+  const settingsChange =
+    settings.verticalOffset !== verticalOffset ||
+    settings.trackersAboveToken !== trackersAboveToken ||
+    settings.barHeightIsReduced !== barHeightIsReduced ||
+    settings.segmentsEnabled !== segmentsEnabled;
+
+  verticalOffset = settings.verticalOffset;
+  trackersAboveToken = settings.trackersAboveToken;
+  barHeightIsReduced = settings.barHeightIsReduced;
+  segmentsEnabled = settings.segmentsEnabled;
+
+  let segmentsChange = false;
+
+  const newSegmentSettings = settings.segmentSettings;
+  if (newSegmentSettings.length !== segmentSettings.size) segmentsChange = true;
+  for (const setting of newSegmentSettings) {
+    if (
+      !segmentSettings.has(setting[0]) ||
+      segmentSettings.get(setting[0]) !== setting[1]
+    )
+      segmentsChange = true;
+  }
+  segmentSettings = new Map(newSegmentSettings);
+
+  const doRefresh = settingsChange || segmentsChange;
+
+  return doRefresh;
 }
 
-export function createImageBubble(
+async function refreshAllTrackers() {
+  //get shapes from scene
+  const items: Image[] = await OBR.scene.items.getItems(
+    (item) =>
+      (item.layer === "CHARACTER" || item.layer === "MOUNT") && isImage(item),
+  );
+
+  //store array of all items currently on the board for change monitoring
+  itemsLast = items;
+
+  //draw health bars
+  const roll = await OBR.player.getRole();
+  const sceneDpi = await OBR.scene.grid.getDpi();
+  for (const item of items) {
+    updateItemTrackers(item, roll, sceneDpi);
+  }
+
+  await OBR.scene.local.deleteItems(deleteItemsArray); //bulk delete items
+  await batchAddToScene(addItemsArray);
+  // await OBR.scene.local.addItems(addItemsArray); //bulk add items
+  //clear add and delete arrays arrays
+  addItemsArray.length = 0;
+  deleteItemsArray.length = 0;
+}
+
+async function startTrackerUpdates() {
+  if (!sceneListenersSet) {
+    // Don't run this again unless the listeners have been unsubscribed
+    sceneListenersSet = true;
+
+    // Initialize previous user role
+    userRoleLast = await OBR.player.getRole();
+
+    // Handle role changes
+    const unSubscribeFromPlayer = OBR.player.onChange((player) => {
+      // Do a refresh if player role change is detected
+      if (player.role !== userRoleLast) {
+        refreshAllTrackers();
+        userRoleLast = player.role;
+      }
+    });
+
+    // Handle Global settings changes
+    const unsubscribeFromSceneMetadata = OBR.room.onMetadataChange(
+      async (metadata) => {
+        const globalSettingsChanged = await getGlobalSettings(metadata);
+        if (globalSettingsChanged) refreshAllTrackers();
+      },
+    );
+
+    // Handle item changes (Update health bars)
+    const unsubscribeFromItems = OBR.scene.items.onChange(
+      async (itemsFromCallback) => {
+        // Filter items for only images from character and mount layers
+        const imagesFromCallback: Image[] = [];
+        for (const item of itemsFromCallback) {
+          if (
+            (item.layer === "CHARACTER" || item.layer === "MOUNT") &&
+            isImage(item)
+          ) {
+            imagesFromCallback.push(item);
+          }
+        }
+
+        const changedItems = getChangedItems(imagesFromCallback);
+
+        //update array of all items currently on the board
+        itemsLast = imagesFromCallback;
+
+        //draw health bars
+        const role = await OBR.player.getRole();
+        const sceneDpi = await OBR.scene.grid.getDpi();
+
+        for (const item of changedItems) {
+          updateItemTrackers(item, role, sceneDpi);
+        }
+
+        await OBR.scene.local.deleteItems(deleteItemsArray); //bulk delete items
+        await OBR.scene.local.addItems(addItemsArray); //bulk add items
+
+        //clear add and delete arrays arrays
+        addItemsArray.length = 0;
+        deleteItemsArray.length = 0;
+      },
+    );
+
+    // Unsubscribe listeners that rely on the scene if it stops being ready
+    const unsubscribeFromSceneReady = OBR.scene.onReadyChange((isReady) => {
+      if (!isReady) {
+        unSubscribeFromPlayer();
+        unsubscribeFromSceneMetadata();
+        unsubscribeFromItems();
+        unsubscribeFromSceneReady();
+        sceneListenersSet = false;
+      }
+    });
+  }
+}
+
+function getChangedItems(items: Image[]): Image[] {
+  const changedItems: Image[] = [];
+
+  let s = 0; // # items skipped in itemsLast array, caused by deleted items
+
+  for (let i = 0; i < items.length; i++) {
+    //check for new items at the end of the list
+    if (i > itemsLast.length - 1 - s) {
+      changedItems.push(items[i]);
+    } else if (itemsLast[i + s].id !== items[i].id) {
+      s++; // Skip an index in itemsLast
+      i--; // Reuse the index item in imagesFromCallback
+      //check for scaling changes
+    } else if (!(
+      itemsLast[i + s].scale.x === items[i].scale.x &&
+      itemsLast[i + s].scale.y === items[i].scale.y
+    )) {
+      // Bar text attachments must be deleted to prevent ghost selection highlight bug
+      deleteItemsArray.push(
+        ...Array(MAX_TRACKER_COUNT)
+          .fill(undefined)
+          .map((_, barIndex) => getBarTextId(items[i].id, barIndex)),
+      );
+      changedItems.push(items[i]);
+    } else if (
+      //check position, visibility, and metadata changes
+      !(
+        itemsLast[i + s].grid.offset.x === items[i].grid.offset.x &&
+        itemsLast[i + s].grid.offset.y === items[i].grid.offset.y &&
+        itemsLast[i + s].grid.dpi === items[i].grid.dpi &&
+        itemsLast[i + s].visible === items[i].visible &&
+        JSON.stringify(
+          itemsLast[i + s].metadata[getPluginId(TRACKER_METADATA_ID)],
+        ) ===
+          JSON.stringify(items[i].metadata[getPluginId(TRACKER_METADATA_ID)]) &&
+        JSON.stringify(
+          itemsLast[i + s].metadata[getPluginId(HIDDEN_METADATA_ID)],
+        ) === JSON.stringify(items[i].metadata[getPluginId(HIDDEN_METADATA_ID)])
+      )
+    ) {
+      //update items
+      changedItems.push(items[i]);
+    }
+  }
+
+  return changedItems;
+}
+
+function updateItemTrackers(
   item: Image,
+  role: "PLAYER" | "GM",
   sceneDpi: number,
-  position: { x: number; y: number },
-  color: string,
-  url: string,
-  imageLabel: string,
-  backgroundLabel: string,
-): Item[] {
-  const bubbleShape = buildShape()
-    .width(BUBBLE_DIAMETER)
-    .height(BUBBLE_DIAMETER)
-    .shapeType("CIRCLE")
-    .fillColor(color)
-    .fillOpacity(BUBBLE_OPACITY)
-    .strokeColor(color)
-    .strokeOpacity(0.5)
-    .strokeWidth(0)
-    .position({ x: position.x, y: position.y })
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(backgroundLabel)
-    .visible(item.visible)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .build();
+) {
+  // Extract metadata from the token
+  const trackers = getTrackersFromItem(item);
+  const trackersHidden = getTrackersHiddenFromItem(item);
 
-  const desiredLength = 24;
-  const IMAGE_DPI = 150; // Specific to visibility off icon used in extension, square so height and width are equal
-  const imageObject = {
-    width: IMAGE_DPI,
-    height: IMAGE_DPI,
-    mime: "image/png",
-    url: url,
-  };
-  const imageInSceneDpi = (sceneDpi * IMAGE_DPI) / desiredLength;
+  if (
+    (role === "GM" && trackers.length === 0 && !trackersHidden) ||
+    (role === "PLAYER" && trackers.length === 0) ||
+    (role === "PLAYER" && trackersHidden && !segmentsEnabled)
+  ) {
+    // Display nothing, delete any existing tracker attachments
+    addAllItemAttachmentsToDeleteList(item.id);
+  } else if (role === "PLAYER" && trackersHidden) {
+    // Display limited trackers depending on GM configuration
+    console.log("Experimental limited view being displayed");
+    createPlayerVisibleTrackers();
+  } else {
+    // Display full trackers
+    createAllTrackers();
+  }
 
-  const image = buildImage(imageObject, {
-    offset: { x: sceneDpi / 2, y: sceneDpi / 2 },
-    dpi: imageInSceneDpi,
-  })
-    .position(position)
-    .attachedTo(item.id)
-    .locked(true)
-    .id(imageLabel)
-    .layer("NOTE")
-    .disableHit(DISABLE_HIT)
-    .visible(item.visible)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .build();
+  function createPlayerVisibleTrackers() {
+    // Determine token bounds
+    const unsafeBounds = getImageBounds(item, sceneDpi);
+    unsafeBounds.width = Math.abs(unsafeBounds.width);
+    unsafeBounds.height = Math.abs(unsafeBounds.height);
+    const bounds = {
+      width: Math.max(unsafeBounds.width, sceneDpi),
+      height: Math.max(unsafeBounds.height, sceneDpi),
+    };
 
-  return [bubbleShape, image];
+    // Determine coordinate origin for drawing stats
+    const origin = getImageCenter(item, sceneDpi);
+    if (trackersAboveToken) origin.y -= bounds.height;
+
+    const barHeight = MINIMAL_BAR_HEIGHT;
+
+    // Add bar trackers
+    const segmentSettingsNames = [...segmentSettings.keys()];
+    const barTrackers = trackers.filter(
+      (tracker) =>
+        tracker.name !== undefined &&
+        segmentSettingsNames.includes(tracker.name) &&
+        tracker.showOnMap !== false &&
+        tracker.variant === "value-max",
+    );
+
+    barTrackers.map((tracker, index) => {
+      if (tracker.name !== undefined && segmentSettings.has(tracker.name)) {
+        addItemsArray.push(
+          ...createMinimalTrackerBar(
+            item,
+            bounds,
+            tracker,
+            {
+              x: origin.x,
+              y:
+                origin.y -
+                index * barHeight +
+                bounds.height / 2 -
+                verticalOffset,
+            },
+            segmentSettings.get(tracker.name),
+            index,
+          ),
+        );
+      }
+    });
+
+    // Clean up extra bars
+    for (let i = barTrackers.length; i < MAX_TRACKER_COUNT; i++) {
+      deleteItemsArray.push(...getBarItemIds(item.id, i));
+    }
+
+    // Delete all bar text attachments
+    for (let i = 0; i < MAX_TRACKER_COUNT; i++) {
+      deleteItemsArray.push(getBarTextId(item.id, i));
+    }
+
+    // Delete all bubbles
+    addAllBubbleTrackersToDeleteList(item.id);
+
+    // Delete Hide bubble
+    addHideBubbleToDeleteList(item.id);
+  }
+
+  function createAllTrackers() {
+    // Determine token bounds
+    const unsafeBounds = getImageBounds(item, sceneDpi);
+    unsafeBounds.width = Math.abs(unsafeBounds.width);
+    unsafeBounds.height = Math.abs(unsafeBounds.height);
+    const bounds = {
+      width: Math.max(unsafeBounds.width, sceneDpi),
+      height: Math.max(unsafeBounds.height, sceneDpi),
+    };
+
+    // Determine coordinate origin for drawing stats
+    const origin = getImageCenter(item, sceneDpi);
+    if (trackersAboveToken) origin.y -= bounds.height;
+
+    const barHeight = barHeightIsReduced ? REDUCED_BAR_HEIGHT : FULL_BAR_HEIGHT;
+
+    // Add bar trackers
+    const barTrackers = trackers.filter(
+      (tracker) => tracker.variant === "value-max",
+    );
+
+    barTrackers.forEach((tracker, index) => {
+      if (tracker.showOnMap === false) {
+        // console.log("hidden", barIndex);
+        deleteItemsArray.push(...getBarItemIds(item.id, index));
+      } else {
+        addItemsArray.push(
+          ...createTrackerBar(
+            item,
+            bounds,
+            tracker,
+            {
+              x: origin.x,
+              y:
+                origin.y -
+                index * barHeight +
+                bounds.height / 2 -
+                verticalOffset,
+            },
+            index,
+            barHeightIsReduced,
+          ),
+        );
+      }
+    });
+
+    // Clean up extra bars
+    for (let i = barTrackers.length; i < MAX_TRACKER_COUNT; i++) {
+      deleteItemsArray.push(...getBarItemIds(item.id, i));
+    }
+
+    const bubblePosition = new BubblePosition(
+      origin,
+      bounds,
+      barTrackers.length,
+      barHeight,
+      trackersAboveToken,
+    );
+
+    // Add hidden indicator
+    const hideLabelName = "hide";
+    if (!trackersHidden) {
+      deleteItemsArray.push(...getImageBubbleItemIds(item.id, hideLabelName));
+    } else {
+      const position = bubblePosition.getNew();
+      const hideIndicator = createImageBubble(
+        item,
+        sceneDpi,
+        { x: position.x, y: position.y - verticalOffset },
+        "black",
+        "https://raw.githubusercontent.com/SeamusFinlayson/owl-trackers/main/src/assets/visibility_off.png",
+        getImageId(item.id, hideLabelName),
+        getImageBackgroundId(item.id, hideLabelName),
+      );
+      addItemsArray.push(...hideIndicator);
+    }
+
+    // Add bubble trackers
+    const bubbleTrackers = trackers.filter(
+      (tracker) =>
+        tracker.variant === "value" ||
+        tracker.variant === "counter" ||
+        tracker.variant === "checkbox",
+    );
+
+    bubbleTrackers.forEach((tracker, index) => {
+      if (tracker.showOnMap === false) {
+        deleteItemsArray.push(...getBubbleItemIds(item.id, index));
+      } else {
+        const position = bubblePosition.getNew(
+          tracker.bubbleSize ?? 30,
+        );
+        addItemsArray.push(
+          ...createTrackerBubble(
+            item,
+            tracker,
+            {
+              x: position.x,
+              y: position.y - verticalOffset,
+            },
+            index,
+          ),
+        );
+      }
+    });
+
+    for (let i = bubbleTrackers.length; i < MAX_TRACKER_COUNT; i++) {
+      deleteItemsArray.push(...getBubbleItemIds(item.id, i));
+    }
+  }
 }
 
-// Constants used in createBarTacker()
-const BAR_PADDING = 2;
-const FILL_OPACITY = 0.8;
-export const FULL_BAR_HEIGHT = 20;
-export const REDUCED_BAR_HEIGHT = 16;
-const BACKGROUND_OPACITY = 0.7;
-const BAR_CORNER_RADIUS = FULL_BAR_HEIGHT / 2;
+const getImageBounds = (item: Image, dpi: number) => {
+  const dpiScale = dpi / item.grid.dpi;
+  const width = item.image.width * dpiScale * item.scale.x;
+  const height = item.image.height * dpiScale * item.scale.y;
+  return { width, height };
+};
 
-/** Creates bar component items */
-export function createTrackerBar(
-  item: Item,
-  bounds: { width: number; height: number },
-  tracker: Tracker,
-  origin: { x: number; y: number },
-  index: number,
-  reducedHeight = false,
-  segments = 0,
-): Item[] {
-  const barHeight = reducedHeight ? REDUCED_BAR_HEIGHT : FULL_BAR_HEIGHT;
-  const position = {
-    x: origin.x - bounds.width / 2 + BAR_PADDING,
-    y: origin.y - barHeight,
-  };
-  const barWidth = bounds.width - BAR_PADDING * 2;
-  const setVisibilityProperty = item.visible;
-
-  if (tracker.variant !== "value-max") throw "Error";
-
-  const trackerBackgroundColor = "black"; // "#A4A4A4";
-
-  const backgroundShape = buildCurve()
-    .fillColor(trackerBackgroundColor)
-    .fillOpacity(BACKGROUND_OPACITY)
-    .strokeWidth(0)
-    .position({ x: position.x, y: position.y })
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(getBarBackgroundId(item.id, index))
-    .visible(setVisibilityProperty)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .tension(0)
-    .closed(true)
-    .points(createRoundedRectangle(barWidth, barHeight, BAR_CORNER_RADIUS))
-    .build();
-
-  const fillPortion = getFillPortion(tracker.value, tracker.max, segments);
-
-  const fillShape = buildCurve()
-    .fillColor(getColor(tracker.color))
-    .fillOpacity(FILL_OPACITY)
-    .strokeWidth(0)
-    .strokeOpacity(0)
-    .position({ x: position.x, y: position.y })
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(getBarFillId(item.id, index))
-    .visible(setVisibilityProperty)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .tension(0)
-    .closed(true)
-    .points(
-      createRoundedRectangle(
-        barWidth,
-        barHeight,
-        BAR_CORNER_RADIUS,
-        fillPortion,
-      ),
-    )
-    .build();
-
-  const barTextHeight = reducedHeight
-    ? REDUCED_BAR_HEIGHT + 8
-    : FULL_BAR_HEIGHT + 8;
-  const barFontSize = reducedHeight
-    ? REDUCED_BAR_HEIGHT + 2
-    : FULL_BAR_HEIGHT + 2;
-
-  const barText = buildText()
-    .position({
-      x: position.x,
-      y: position.y + TEXT_VERTICAL_OFFSET + -5.3 - (reducedHeight ? -0.8 : 0),
-    })
-    .plainText(`${tracker.value}/${tracker.max}`)
-    .textAlign("CENTER")
-    .textAlignVertical("MIDDLE")
-    .fontSize(barFontSize)
-    .fontFamily(FONT)
-    .textType("PLAIN")
-    .height(barTextHeight)
-    .width(barWidth)
-    .fontWeight(400)
-    //.strokeColor("black")
-    //.strokeWidth(0)
-    .attachedTo(item.id)
-    .fillOpacity(1)
-    .layer("TEXT")
-    .locked(true)
-    .id(getBarTextId(item.id, index))
-    .visible(setVisibilityProperty)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .build();
-
-  return [backgroundShape, fillShape, barText];
+function addAllItemAttachmentsToDeleteList(itemId: string) {
+  for (let i = 0; i < MAX_TRACKER_COUNT; i++) {
+    deleteItemsArray.push(...getBarItemIds(itemId, i));
+  }
+  addAllBubbleTrackersToDeleteList(itemId);
+  addHideBubbleToDeleteList(itemId);
 }
 
-export const MINIMAL_BAR_HEIGHT = 12;
-
-/** Creates bar component items */
-export function createMinimalTrackerBar(
-  item: Item,
-  bounds: { width: number; height: number },
-  tracker: Tracker,
-  origin: { x: number; y: number },
-  segments = 0,
-  index: number,
-): Item[] {
-  const barHeight = MINIMAL_BAR_HEIGHT;
-  const position = {
-    x: origin.x - bounds.width / 2 + BAR_PADDING,
-    y: origin.y - barHeight,
-  };
-  const barWidth = bounds.width - BAR_PADDING * 2;
-  const setVisibilityProperty = item.visible;
-
-  if (tracker.variant !== "value-max") throw "Error";
-
-  const trackerBackgroundColor = "black"; // "#A4A4A4";
-
-  const backgroundShape = buildCurve()
-    .fillColor(trackerBackgroundColor)
-    .fillOpacity(BACKGROUND_OPACITY)
-    .strokeWidth(0)
-    .position({ x: position.x, y: position.y })
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(getBarBackgroundId(item.id, index))
-    .visible(setVisibilityProperty)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .tension(0)
-    .closed(true)
-    .points(createRoundedRectangle(barWidth, barHeight, BAR_CORNER_RADIUS))
-    .build();
-
-  const fillPortion = getFillPortion(tracker.value, tracker.max, segments);
-
-  const fillShape = buildCurve()
-    .fillColor(getColor(tracker.color))
-    .fillOpacity(FILL_OPACITY)
-    .strokeWidth(0)
-    .strokeOpacity(0)
-    .position({ x: position.x, y: position.y })
-    .attachedTo(item.id)
-    .layer("ATTACHMENT")
-    .locked(true)
-    .id(getBarFillId(item.id, index))
-    .visible(setVisibilityProperty)
-    .disableAttachmentBehavior(DISABLE_ATTACHMENT_BEHAVIORS)
-    .disableHit(DISABLE_HIT)
-    .tension(0)
-    .closed(true)
-    .points(
-      createRoundedRectangle(
-        barWidth,
-        barHeight,
-        BAR_CORNER_RADIUS,
-        fillPortion,
-      ),
-    )
-    .build();
-
-  return [backgroundShape, fillShape];
+function addAllBubbleTrackersToDeleteList(itemId: string) {
+  for (let i = 0; i < MAX_TRACKER_COUNT; i++) {
+    deleteItemsArray.push(...getBubbleItemIds(itemId, i));
+  }
 }
 
-export const getBubbleBackgroundId = (itemId: string, position: number) =>
-  `${itemId}-${position}-bubble-bg`;
-export const getBubbleTextId = (itemId: string, position: number) =>
-  `${itemId}-${position}-bubble-text`;
-
-export const getImageBackgroundId = (itemId: string, label: string) =>
-  `${itemId}-${label}-img-bg`;
-export const getImageId = (itemId: string, label: string) =>
-  `${itemId}-${label}-img`;
-
-export const getBarBackgroundId = (itemId: string, position: number) =>
-  `${itemId}-${position}-bar-bg`;
-export const getBarFillId = (itemId: string, position: number) =>
-  `${itemId}-${position}-bar-fill`;
-export const getBarTextId = (itemId: string, position: number) =>
-  `${itemId}-${position}-bar-text`;
-
-export function getBubbleItemIds(itemId: string, position: number) {
-  return [
-    getBubbleBackgroundId(itemId, position),
-    getBubbleTextId(itemId, position),
-  ];
+function addHideBubbleToDeleteList(itemId: string) {
+  deleteItemsArray.push(...getImageBubbleItemIds(itemId, "hide"));
 }
 
-export function getImageBubbleItemIds(itemId: string, label: string) {
-  return [getImageBackgroundId(itemId, label), getImageId(itemId, label)];
-}
-
-export function getBarItemIds(itemId: string, position: number) {
-  return [
-    getBarBackgroundId(itemId, position),
-    getBarFillId(itemId, position),
-    getBarTextId(itemId, position),
-  ];
+// Prevent errors when many items are added at onces
+const MAX_UPDATE_LENGTH = 100;
+async function batchAddToScene(items: Item[]) {
+  for (let i = 0; i < Math.ceil(items.length / MAX_UPDATE_LENGTH); i++) {
+    await OBR.scene.local.addItems(
+      items.slice(i * MAX_UPDATE_LENGTH, (i + 1) * MAX_UPDATE_LENGTH),
+    );
+  }
 }
