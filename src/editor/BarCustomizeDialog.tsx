@@ -68,7 +68,7 @@ export default function BarCustomizeDialog({
           <RangeControl
             label="Bar width"
             value={tracker.barWidthPercent ?? 100}
-            min={30}
+            min={5}
             max={150}
             suffix="%"
             onChange={(value) => onChange("barWidthPercent", value)}
