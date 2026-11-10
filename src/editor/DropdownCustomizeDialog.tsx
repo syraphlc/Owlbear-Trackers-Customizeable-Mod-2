@@ -78,7 +78,7 @@ export default function DropdownCustomizeDialog({
           <RangeControl
             label="Label width"
             value={labelWidth}
-            min={40}
+            min={10}
             max={400}
             suffix=" px"
             onChange={(value) => onChange("dropdownLabelWidth", value)}
