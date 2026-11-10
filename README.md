@@ -1,3 +1,7 @@
+# Note
+
+This is a simple mod that allows you to customize the bars just a little bit more! Original credits go to Seamus Finlayson. 
+
 # Owl Trackers
 
 System-agnostic token trackers for [Owlbear Rodeo](https://www.owlbear.rodeo/).
