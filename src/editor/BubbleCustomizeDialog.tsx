@@ -217,7 +217,7 @@ function ColorControl({
       label={label}
       value={value}
       onChange={(event) => onChange(event.target.value)}
-      inputProps={{ "aria-label": label }}
+      slotProps={{ htmlInput: { "aria-label": label } }}
       sx={{ "& input": { height: 24, p: 0.5, cursor: "pointer" } }}
     />
   );
